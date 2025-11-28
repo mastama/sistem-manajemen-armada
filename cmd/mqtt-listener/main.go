@@ -1,3 +1,4 @@
+// cmd/mqtt-listener/main.go
 package main
 
 import (
@@ -5,12 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
-	_ "math"
 	"strings"
 	"time"
 
 	"sistem-manajemen-armada/internal/config"
+	"sistem-manajemen-armada/internal/geofence"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -39,13 +39,11 @@ func waitForPostgres(ctx context.Context, dsn string, maxAttempts int, baseDelay
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// bikin pool
 		pool, err := pgxpool.New(ctx, dsn)
 		if err != nil {
 			log.Printf("postgres create pool try %d failed: %v", attempt, err)
 			lastErr = err
 		} else {
-			// ping dengan timeout kecil
 			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			err = pool.Ping(pingCtx)
 			cancel()
@@ -60,7 +58,6 @@ func waitForPostgres(ctx context.Context, dsn string, maxAttempts int, baseDelay
 			pool.Close()
 		}
 
-		// backoff sederhana: 1s,2s,3s,...
 		time.Sleep(time.Duration(attempt) * baseDelay)
 	}
 
@@ -69,8 +66,10 @@ func waitForPostgres(ctx context.Context, dsn string, maxAttempts int, baseDelay
 
 func main() {
 	cfg := config.Load()
-
 	ctx := context.Background()
+
+	// --- Inisialisasi geofence sekali, dipakai di handler ---
+	gf := geofence.NewGeofence(cfg.GeofenceLat, cfg.GeofenceLon, cfg.GeofenceRadius)
 
 	// --- Postgres dengan retry ---
 	dbpool, err := waitForPostgres(ctx, cfg.PostgresURL, 10, time.Second)
@@ -156,6 +155,7 @@ func main() {
 			return
 		}
 
+		// Jika vehicle_id kosong, ambil dari topic: /fleet/vehicle/{id}/location
 		if loc.VehicleID == "" {
 			parts := strings.Split(m.Topic(), "/")
 			if len(parts) >= 4 {
@@ -176,7 +176,8 @@ func main() {
 			return
 		}
 
-		if insideGeofence(cfg.GeofenceLat, cfg.GeofenceLon, cfg.GeofenceRadius, loc.Latitude, loc.Longitude) {
+		// Pakai geofence.IsInside dari package internal/geofence
+		if gf.IsInside(loc.Latitude, loc.Longitude) {
 			ev := GeofenceEvent{
 				VehicleID: loc.VehicleID,
 				Event:     "geofence_entry",
@@ -209,23 +210,4 @@ func main() {
 	log.Printf("Subscribed to MQTT topic %s", topic)
 
 	select {}
-}
-
-func insideGeofence(centerLat, centerLon, radiusM, lat, lon float64) bool {
-	const earthRadius = 6371000.0 // meter
-
-	dLat := toRad(lat - centerLat)
-	dLon := toRad(lon - centerLon)
-
-	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
-		math.Cos(toRad(centerLat))*math.Cos(toRad(lat))*math.Sin(dLon/2)*math.Sin(dLon/2)
-
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	d := earthRadius * c
-
-	return d <= radiusM
-}
-
-func toRad(deg float64) float64 {
-	return deg * math.Pi / 180
 }

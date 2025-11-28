@@ -1,0 +1,105 @@
+services:
+  # ---------- Infrastruktur ----------
+  db:
+    image: postgres:15
+    container_name: fleet-db
+    environment:
+      POSTGRES_USER: mastama
+      POSTGRES_PASSWORD: post456
+      POSTGRES_DB: fleetdb
+    ports:
+      - "5444:5432"
+    volumes:
+      - fleet-db:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U mastama -d fleetdb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: fleet-mqtt
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: fleet-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+
+  # ---------- Service API utama ----------
+  api:
+    build: .
+    command: ["./bin/api"]
+    environment:
+      APP_PORT: "8080"
+      POSTGRES_URL: "postgres://mastama:post456@db:5432/fleetdb?sslmode=disable"
+      MQTT_BROKER_URL: "tcp://mqtt:1883"
+      RABBIT_URL: "amqp://guest:guest@rabbitmq:5672/"
+      RABBIT_EXCHANGE: "fleet.events"
+      RABBIT_QUEUE: "geofence_alerts"
+      RABBIT_ROUTING_KEY: "geofence.entry"
+      GEOFENCE_LAT: "-6.2088"
+      GEOFENCE_LON: "106.8456"
+      GEOFENCE_RADIUS: "50"
+    depends_on:
+      - db
+      - mqtt
+      - rabbitmq
+    ports:
+      - "8080:8080"
+
+  # ---------- MQTT Listener (subscribe MQTT -> simpan ke DB -> kirim event ke RabbitMQ) ----------
+  mqtt-listener:
+    build: .
+    command: [ "./bin/mqtt-listener" ]
+    environment:
+      POSTGRES_URL: "postgres://mastama:post456@db:5432/fleetdb?sslmode=disable"
+      MQTT_BROKER_URL: "tcp://mqtt:1883"
+      RABBIT_URL: "amqp://guest:guest@rabbitmq:5672/"
+      RABBIT_EXCHANGE: "fleet.events"
+      RABBIT_QUEUE: "geofence_alerts"
+      RABBIT_ROUTING_KEY: "geofence.entry"
+      GEOFENCE_LAT: "-6.2088"
+      GEOFENCE_LON: "106.8456"
+      GEOFENCE_RADIUS: "50"
+    depends_on:
+      db:
+        condition: service_healthy   # nunggu Postgres benar-benar siap
+      mqtt:
+        condition: service_started   # cukup container jalan
+      rabbitmq:
+        condition: service_started
+    restart: on-failure
+
+  # ---------- Geofence Worker (consume dari RabbitMQ) ----------
+  geofence-worker:
+    build: .
+    command: ["./bin/geofence-worker"]
+    environment:
+      RABBIT_URL: "amqp://guest:guest@rabbitmq:5672/"
+      RABBIT_EXCHANGE: "fleet.events"
+      RABBIT_QUEUE: "geofence_alerts"
+      RABBIT_ROUTING_KEY: "geofence.entry"
+    depends_on:
+      - rabbitmq
+
+  # ---------- Mock MQTT Publisher (kirim lokasi dummy ke MQTT) ----------
+  mqtt-publisher:
+    build: .
+    command: ["./bin/mqtt-publisher"]
+    environment:
+      MQTT_BROKER_URL: "tcp://mqtt:1883"
+      GEOFENCE_LAT: "-6.2088"
+      GEOFENCE_LON: "106.8456"
+    depends_on:
+      - mqtt
+
+volumes:
+  fleet-db:
